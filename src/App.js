@@ -1,5 +1,8 @@
 import { useState, useEffect } from 'react';
-import { ChevronDown, ChevronRight, CheckCircle2, Circle, BookOpen, Target, Clock, Trophy, ExternalLink, Calendar, FileText, Download, Settings, X, Edit3, Save } from 'lucide-react';
+import { ChevronDown, ChevronRight, CheckCircle2, Circle, BookOpen, Target, Clock, Trophy, ExternalLink, Calendar, FileText, Download, Settings, X, Edit3, Save, LogIn, LogOut, User } from 'lucide-react';
+import { auth, googleProvider, db } from './firebase';
+import { signInWithPopup, signOut, onAuthStateChanged } from 'firebase/auth';
+import { doc, getDoc, setDoc } from 'firebase/firestore';
 
 const roadmapData = [
   {
@@ -220,62 +223,92 @@ const roadmapData = [
   }
 ];
 
-// Storage helper using localStorage
-const storage = {
-  get: (key) => {
-    try {
-      const item = localStorage.getItem(key);
-      return item ? JSON.parse(item) : null;
-    } catch { return null; }
-  },
-  set: (key, value) => {
-    try {
-      localStorage.setItem(key, JSON.stringify(value));
-    } catch (e) { console.error('Storage error:', e); }
-  }
-};
+const defaultData = { progress: {}, notes: {}, hoursLogged: {}, startDate: null };
 
 function App() {
-  const [data, setData] = useState({ progress: {}, notes: {}, hoursLogged: {}, startDate: null });
+  const [user, setUser] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [data, setData] = useState(defaultData);
   const [expandedMonths, setExpandedMonths] = useState({});
   const [activeTab, setActiveTab] = useState('roadmap');
   const [showSettings, setShowSettings] = useState(false);
   const [editingNote, setEditingNote] = useState(null);
   const [tempNote, setTempNote] = useState('');
   const [tempHours, setTempHours] = useState({});
+  const [saving, setSaving] = useState(false);
 
   useEffect(() => {
-    const saved = storage.get('roadmap-data-v2');
-    if (saved) setData(saved);
+    const unsubscribe = onAuthStateChanged(auth, async (user) => {
+      setUser(user);
+      if (user) {
+        const docRef = doc(db, 'users', user.uid);
+        const docSnap = await getDoc(docRef);
+        if (docSnap.exists()) {
+          setData(docSnap.data());
+        }
+      } else {
+        setData(defaultData);
+      }
+      setLoading(false);
+    });
+    return () => unsubscribe();
   }, []);
 
-  const saveData = (newData) => {
+  const saveToFirebase = async (newData) => {
+    if (!user) return;
+    setSaving(true);
+    try {
+      await setDoc(doc(db, 'users', user.uid), newData);
+    } catch (e) {
+      console.error('Save error:', e);
+    }
+    setSaving(false);
+  };
+
+  const updateData = (newData) => {
     setData(newData);
-    storage.set('roadmap-data-v2', newData);
+    saveToFirebase(newData);
+  };
+
+  const handleLogin = async () => {
+    try {
+      await signInWithPopup(auth, googleProvider);
+    } catch (e) {
+      console.error('Login error:', e);
+    }
+  };
+
+  const handleLogout = async () => {
+    try {
+      await signOut(auth);
+      setData(defaultData);
+    } catch (e) {
+      console.error('Logout error:', e);
+    }
   };
 
   const toggleTask = (monthIdx, weekIdx, taskIdx) => {
     const key = `${monthIdx}-${weekIdx}-${taskIdx}`;
-    saveData({ ...data, progress: { ...data.progress, [key]: !data.progress[key] } });
+    updateData({ ...data, progress: { ...data.progress, [key]: !data.progress[key] } });
   };
 
   const toggleProject = (monthIdx) => {
     const key = `project-${monthIdx}`;
-    saveData({ ...data, progress: { ...data.progress, [key]: !data.progress[key] } });
+    updateData({ ...data, progress: { ...data.progress, [key]: !data.progress[key] } });
   };
 
   const saveNote = (monthIdx) => {
-    saveData({ ...data, notes: { ...data.notes, [monthIdx]: tempNote } });
+    updateData({ ...data, notes: { ...data.notes, [monthIdx]: tempNote } });
     setEditingNote(null);
     setTempNote('');
   };
 
   const saveHours = (monthIdx) => {
     const hours = parseFloat(tempHours[monthIdx]) || 0;
-    saveData({ ...data, hoursLogged: { ...data.hoursLogged, [monthIdx]: hours } });
+    updateData({ ...data, hoursLogged: { ...data.hoursLogged, [monthIdx]: hours } });
   };
 
-  const setStartDate = (date) => saveData({ ...data, startDate: date });
+  const setStartDate = (date) => updateData({ ...data, startDate: date });
 
   const toggleMonth = (monthIdx) => setExpandedMonths(prev => ({ ...prev, [monthIdx]: !prev[monthIdx] }));
 
@@ -321,37 +354,50 @@ function App() {
 
   const resetProgress = () => {
     if (window.confirm('Reset all progress, notes, and hours? This cannot be undone.')) {
-      saveData({ progress: {}, notes: {}, hoursLogged: {}, startDate: data.startDate });
+      updateData({ progress: {}, notes: {}, hoursLogged: {}, startDate: data.startDate });
     }
   };
 
   const exportReport = () => {
     const overall = getOverallProgress();
-    const schedule = getScheduleStatus();
     const totalPlanned = roadmapData.reduce((s, m) => s + m.hours, 0);
     const totalLogged = Object.values(data.hoursLogged).reduce((s, h) => s + (h || 0), 0);
-    
     let report = `# Data Engineering Roadmap Progress Report\nGenerated: ${new Date().toLocaleDateString()}\n\n`;
-    if (data.startDate) {
-      report += `## Timeline\n- Start Date: ${formatDate(data.startDate)}\n- Target End: ${formatDate(getTargetEndDate())}\n`;
-      if (schedule) report += `- Days In: ${schedule.daysIn}\n- Status: ${schedule.diff >= 0 ? `${schedule.diff} month(s) ahead` : `${Math.abs(schedule.diff)} month(s) behind`}\n`;
-      report += `\n`;
-    }
-    report += `## Overall Progress\n- Tasks: ${overall.completed}/${overall.total} (${overall.percent}%)\n- Hours: ${totalLogged}/${totalPlanned}\n\n## Monthly Breakdown\n\n`;
-    
+    report += `## Overall Progress\n- Tasks: ${overall.completed}/${overall.total} (${overall.percent}%)\n- Hours: ${totalLogged}/${totalPlanned}\n\n`;
     roadmapData.forEach((month, idx) => {
       const mp = getMonthProgress(idx);
-      report += `### Month ${month.month}: ${month.title}\n- Progress: ${mp.percent}%\n- Hours: ${data.hoursLogged[idx] || 0}/${month.hours}\n- Project: ${data.progress[`project-${idx}`] ? '✅' : '⬜'}\n`;
-      if (data.notes[idx]) report += `- Notes: ${data.notes[idx]}\n`;
-      report += `\n`;
+      report += `### Month ${month.month}: ${month.title}\n- Progress: ${mp.percent}%\n- Project: ${data.progress[`project-${idx}`] ? '✅' : '⬜'}\n\n`;
     });
-    
     const blob = new Blob([report], { type: 'text/markdown' });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
     a.download = `roadmap-progress-${new Date().toISOString().split('T')[0]}.md`;
     a.click();
   };
+
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-slate-900 flex items-center justify-center">
+        <div className="text-white text-xl">Loading...</div>
+      </div>
+    );
+  }
+
+  if (!user) {
+    return (
+      <div className="min-h-screen bg-slate-900 flex items-center justify-center p-4">
+        <div className="bg-slate-800 rounded-xl p-8 max-w-md w-full text-center">
+          <h1 className="text-3xl font-bold text-white mb-2">Data Engineering Roadmap</h1>
+          <p className="text-slate-400 mb-8">12-Month Learning Journey for Vend Park</p>
+          <button onClick={handleLogin} className="w-full py-3 bg-white text-slate-900 rounded-lg font-medium flex items-center justify-center gap-3 hover:bg-slate-100 transition">
+            <svg className="w-5 h-5" viewBox="0 0 24 24"><path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/><path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/><path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/><path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/></svg>
+            Sign in with Google
+          </button>
+          <p className="text-slate-500 text-sm mt-6">Your progress syncs across all devices</p>
+        </div>
+      </div>
+    );
+  }
 
   const overall = getOverallProgress();
   const schedule = getScheduleStatus();
@@ -367,9 +413,12 @@ function App() {
             <h1 className="text-2xl md:text-3xl font-bold text-white mb-1">Data Engineering Roadmap</h1>
             <p className="text-slate-400">12-Month Learning Journey for Vend Park</p>
           </div>
-          <button onClick={() => setShowSettings(true)} className="p-2 bg-slate-800 rounded-lg hover:bg-slate-700">
-            <Settings size={20} className="text-slate-400" />
-          </button>
+          <div className="flex items-center gap-2">
+            {saving && <span className="text-xs text-emerald-400">Saving...</span>}
+            <button onClick={() => setShowSettings(true)} className="p-2 bg-slate-800 rounded-lg hover:bg-slate-700">
+              <Settings size={20} className="text-slate-400" />
+            </button>
+          </div>
         </div>
 
         {showSettings && (
@@ -380,12 +429,24 @@ function App() {
                 <button onClick={() => setShowSettings(false)}><X size={20} className="text-slate-400" /></button>
               </div>
               <div className="space-y-4">
+                <div className="flex items-center gap-3 p-3 bg-slate-700 rounded-lg">
+                  <div className="w-10 h-10 bg-emerald-600 rounded-full flex items-center justify-center">
+                    <User size={20} className="text-white" />
+                  </div>
+                  <div className="flex-1">
+                    <p className="text-white font-medium">{user.displayName}</p>
+                    <p className="text-slate-400 text-sm">{user.email}</p>
+                  </div>
+                </div>
                 <div>
                   <label className="block text-sm text-slate-400 mb-1">Start Date</label>
                   <input type="date" value={data.startDate || ''} onChange={(e) => setStartDate(e.target.value)} className="w-full bg-slate-700 border border-slate-600 rounded-lg px-3 py-2 text-white" />
                 </div>
                 {data.startDate && <div className="bg-slate-700 rounded-lg p-3 text-sm"><p className="text-slate-300">Target End: <span className="text-emerald-400 font-medium">{formatDate(getTargetEndDate())}</span></p></div>}
                 <button onClick={resetProgress} className="w-full py-2 bg-red-900/50 text-red-300 rounded-lg hover:bg-red-900">Reset All Progress</button>
+                <button onClick={handleLogout} className="w-full py-2 bg-slate-700 text-slate-300 rounded-lg hover:bg-slate-600 flex items-center justify-center gap-2">
+                  <LogOut size={16} /> Sign Out
+                </button>
               </div>
             </div>
           </div>
@@ -554,7 +615,7 @@ function App() {
           </div>
         )}
 
-        <div className="mt-6 text-center text-xs text-slate-600">Progress saves automatically</div>
+        <div className="mt-6 text-center text-xs text-slate-600">Signed in as {user.email} • Progress syncs automatically</div>
       </div>
     </div>
   );
